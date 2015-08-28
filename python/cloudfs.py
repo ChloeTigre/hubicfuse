@@ -5,7 +5,7 @@
 CloudFS API port to python
 
 """
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 import os
 import stat
 import requests
@@ -26,6 +26,20 @@ segment_info = namedtuple("segment_info", "fh part size segment_size seg_base me
 
 options = namedtuple("options", "cache_timeout verify_ssl segment_size segment_above storage_url container temp_dir client_id client_secret refresh_token")
 
+class File(OrderedDict):
+    def __init__(self, *args, **kwargs):
+
+        fname = kwargs.pop('fname', None)
+        if fname is None:
+            fname = kwargs['name']
+        self.fname = fname
+        OrderedDict.__init__(self, *args, **kwargs)
+    pass
+
+class Directory(OrderedDict):
+    def __init__(self, dirname, *args, **kwargs):
+        self.dirname = dirname
+        OrderedDict.__init__(self, *args, **kwargs)
 
 class CloudFS(object):
     """
@@ -105,13 +119,39 @@ class CloudFS(object):
         """create a directory"""
         pass
 
+    def _cache_directory(self, refresh = False):
+        if refresh or self._dircache is None:
+            default_container = self._send_request_size('GET', '').content.replace('\n', '')
+            data = self._send_request_size('GET', '{}/?format=json'.format(
+                default_container)
+                ).json()
+            datatree = {}
+            for f in data:
+                if f['content_type'] == 'application/directory': continue
+                pathsplit = f['name'].split('/')
+                newpath = datatree
+                n = newpath
+                for elm in pathsplit[0:-1]:
+                    if elm not in n:
+                        n[elm] = Directory(dirname=elm)
+                    n = n[elm]
+                n[pathsplit[-1]] = File(fname=pathsplit[-1], **f)
+                datatree.update(newpath)
+            self._dircache = datatree
+        return self._dircache
+
     def list_directory(self, dirpath):
-        default_container = self._send_request_size('GET', '').content.replace('\n', '')
-        print(default_container)
-        data = self._send_request_size('GET', '{}/?format=json'.format(
-            default_container)
-            ).json()
-        return data
+        dircache = self._cache_directory()
+        spl = dirpath.split('/')
+        n = dircache
+        for e in spl:
+            n = n.get(e, ValueError("Item does not exist"))
+            if isinstance(n, ValueError):
+                raise n
+
+        files = [ a for a in n.itervalues() if isinstance(a, File)]
+        dirs = [ a for a in n.itervalues() if isinstance(a, Directory)]
+        return files, dirs
 
     def delete_object(self, objpath):
         pass
@@ -136,6 +176,7 @@ class CloudFS(object):
         self.free_blocks = None
         self.file_quota = None
         self.files_free = None
+        self._dircache = None
 
 
 class Hubic(CloudFS):
@@ -165,6 +206,7 @@ class Hubic(CloudFS):
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
+        CloudFS.__init__(self)
 
 
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
