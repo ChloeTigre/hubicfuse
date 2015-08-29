@@ -15,6 +15,7 @@ import enum
 import io
 from urllib2 import unquote, quote
 
+from datetime import datetime
 #define BUFFER_INITIAL_SIZE 4096
 #define MAX_HEADER_SIZE 8192
 #define MAX_PATH_SIZE (1024 + 256 + 3)
@@ -43,37 +44,89 @@ class Directory(OrderedDict):
         self.dirname = dirname
         OrderedDict.__init__(self, *args, **kwargs)
 
-class FileIO(io.BufferedIOBase):
+class FileIO(object):
+
+    MAX_CHUNK_SIZE = 1024 * 1024 * 2
+
+    """totally thread unsafe IO interface with a read buffer"""
     def __init__(self, url, cfsobj):
         self.url = url
         self.cfsobj = cfsobj
+        self.reset()
+
+    def reset(self):
         self._head = 0
-        self._seeksize = 1024 * 512
         self._readable = True
-        self._getinfo()
         self._datawindow = bytes()
+        self._lhead = 0
+        self._feof = False
+        self.closed = False
+        self._getinfo()
+
+
+    def stat(self):
+        return dict(st_mode=self.cfsobj._mode, st_mtime=self._mtime,
+            st_uid=self.cfsobj._uid, st_gid=self.cfsobj._gid)
 
     def _getinfo(self):
         data = self.cfsobj._send_request('HEAD', self.url)
         if data.status_code >= 200 and data.status_code < 400:
+            self._size = int(data.headers['content-length'])
+            self._seekunit = 1 if 'bytes' in data.headers['accept-ranges'] else 1
+            self._mtime = datetime.fromtimestamp(float(data.headers['x-timestamp']))
+        else:
             self._readable = False
-            return
-        self._size = data.headers['content-length']
-        self._seekunit = 1 if 'bytes' in data.headers['accept-ranges'] else 1
         
     def _getchunk(self, size):
+        if self._feof:
+            return False
         first = self._head
-        last = first + size * self._seekunit
-        h = { 'Content-Range': 'bytes {}-{}/{}'.format(
+        last = min(self._size, first + size * self._seekunit)
+        h = { 'Range': 'bytes={}-{}'.format(
                 first,
-                last,
-                self._size
+                last
             )}
         data = self.cfsobj._send_request('GET', self.url, extra_headers = h)
         if data.status_code >= 200 and data.status_code < 400:
-            self._readable = False
-            return
-        self._datawindow = bytes(data.content)
+            if last == self._size:
+                self._feof = True
+            self._datawindow = bytes(data.content)
+            self._lhead = 0
+            self._head += last - first
+            return True
+        else:
+            self._feof = True
+            print("Error", data.status_code)
+            return False
+
+    def read_generator(self, size=-1):
+        if self.closed: raise IOError("reading closed file")
+        if size == -1:
+            data_to_read = self._size
+            size = self.MAX_CHUNK_SIZE
+        else:
+            data_to_read = size
+        while data_to_read >= 0 and self._readable:
+            if self._lhead + size > len(self._datawindow):
+                oldchunk = self._datawindow
+                oldhead = self._lhead
+                if not self._getchunk(self.MAX_CHUNK_SIZE):
+                    self._readable = False
+                    yield oldchunk[oldhead:-1]
+                    continue
+                else:
+                    left = size - len(oldchunk) + oldhead
+                    yield oldchunk[oldhead:-1] + self._datawindow[0:left]
+                    self._lhead = left
+                    data_to_read -= size
+            else:
+                yield self._datawindow[self._lhead:self._lhead+size]
+                self._lhead += size
+                data_to_read -= size
+
+    def read(self, size=-1):
+        if self.closed: return IOError("reading closed file")
+        return ''.join(a for a in self.read_generator(size))
         
     def seekable(self):
         return False
@@ -82,13 +135,12 @@ class FileIO(io.BufferedIOBase):
         return self._readable
 
     def tell(self):
-        return self._head
+        return self._head + self._lhead
 
     def close(self):
         self.closed = True
     
     def readline(self, size=-1):
-        
         pass
 
     def readlines(self, hint=-1):
@@ -97,7 +149,8 @@ class FileIO(io.BufferedIOBase):
 
 class CloudFS(object):
     """
-    Implements CloudFS logic in python
+    Implements CloudFS logic in python. Some logic is deported to specific objects
+        - Files are hadled by FileIO which implements an IO-like interface
     """
 
     @property
@@ -109,17 +162,18 @@ class CloudFS(object):
         return self._default_container
 
     def _header_dispatch(self, headers):
+        self._last_headers = headers
         # requests takes care of case sensitivity
-            if 'x-auth-token' in headers:
-                self.storage_token = headers['x-auth-token']
-            if 'x-storage-url' in headers:
-                self.storage_url = headers['x-storage-url']
-            if 'x-account-meta-quota' in headers:
-                self.block_quota = int(headers['x-account-meta-quota'])
-            if 'x-account-bytes-used' in headers:
-                self.free_blocks = self.block_quota - int(headers['x-account-bytes-used'])
-            if 'x-account-object-count' in headers:
-                pass
+        if 'x-auth-token' in headers:
+            self.storage_token = headers['x-auth-token']
+        if 'x-storage-url' in headers:
+            self.storage_url = headers['x-storage-url']
+        if 'x-account-meta-quota' in headers:
+            self.block_quota = int(headers['x-account-meta-quota'])
+        if 'x-account-bytes-used' in headers:
+            self.free_blocks = self.block_quota - int(headers['x-account-bytes-used'])
+        if 'x-account-object-count' in headers:
+            pass
 
     def _send_request(self, method, path, extra_headers = [], params = None):
         tries = 3
@@ -128,7 +182,6 @@ class CloudFS(object):
         method = method.upper()
         path = unquote(path)
         url = u'{}{}/{}'.format(self.storage_url, self.default_container, path)
-        print(url)
         
         if 'MKDIR' == method:
             headers['Content-Type'] = 'application/directory'
@@ -197,12 +250,6 @@ class CloudFS(object):
         return files, dirs
 
     def get_file(self, path, packetsize = 512*1024, offset = 0):
-        data = self._send_request('HEAD', path)
-        filesize = data.headers['content-length']
-        if filesize > packetsize:
-            pass
-        else:
-            pass
         return FileIO(url = path, cfsobj = self)
 
     def delete_object(self, objpath):
@@ -219,7 +266,7 @@ class CloudFS(object):
         self.client_secret = client_secret
         self.refresh_token = refresh_token
 
-    def __init__(self):
+    def __init__(self, parameters = {}):
         # initialize structures
         self.statcache = dict()
         self.storage_token = None
@@ -230,6 +277,9 @@ class CloudFS(object):
         self.files_free = None
         self._dircache = None
         self._default_container = None
+        self._uid = parameters.get('uid', 0)
+        self._gid = parameters.get('uid', 0)
+        self._mode = parameters.get('mode', 0750)
 
 
 class Hubic(CloudFS):
@@ -255,11 +305,12 @@ class Hubic(CloudFS):
         self.storage_token = r['token']
         print("Done")
 
-    def __init__(self, client_id, client_secret, refresh_token):
+    def __init__(self, client_id, client_secret, refresh_token, *args, **kwargs):
+        
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
-        CloudFS.__init__(self)
+        CloudFS.__init__(self, *args, **kwargs)
 
 
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
