@@ -11,6 +11,8 @@ import stat
 import requests
 from requests.auth import HTTPBasicAuth
 import json
+import enum
+import io
 from urllib2 import unquote, quote
 
 #define BUFFER_INITIAL_SIZE 4096
@@ -41,10 +43,71 @@ class Directory(OrderedDict):
         self.dirname = dirname
         OrderedDict.__init__(self, *args, **kwargs)
 
+class FileIO(io.BufferedIOBase):
+    def __init__(self, url, cfsobj):
+        self.url = url
+        self.cfsobj = cfsobj
+        self._head = 0
+        self._seeksize = 1024 * 512
+        self._readable = True
+        self._getinfo()
+        self._datawindow = bytes()
+
+    def _getinfo(self):
+        data = self.cfsobj._send_request('HEAD', self.url)
+        if data.status_code >= 200 and data.status_code < 400:
+            self._readable = False
+            return
+        self._size = data.headers['content-length']
+        self._seekunit = 1 if 'bytes' in data.headers['accept-ranges'] else 1
+        
+    def _getchunk(self, size):
+        first = self._head
+        last = first + size * self._seekunit
+        h = { 'Content-Range': 'bytes {}-{}/{}'.format(
+                first,
+                last,
+                self._size
+            )}
+        data = self.cfsobj._send_request('GET', self.url, extra_headers = h)
+        if data.status_code >= 200 and data.status_code < 400:
+            self._readable = False
+            return
+        self._datawindow = bytes(data.content)
+        
+    def seekable(self):
+        return False
+    
+    def readable(self):
+        return self._readable
+
+    def tell(self):
+        return self._head
+
+    def close(self):
+        self.closed = True
+    
+    def readline(self, size=-1):
+        
+        pass
+
+    def readlines(self, hint=-1):
+        pass
+
+
 class CloudFS(object):
     """
     Implements CloudFS logic in python
     """
+
+    @property
+    def default_container(self):
+        if self._default_container is None:
+            self._default_container = ''
+            dc = self._send_request('GET', '').content.replace('\n', '')
+            self._default_container = '/' + dc
+        return self._default_container
+
     def _header_dispatch(self, headers):
         # requests takes care of case sensitivity
             if 'x-auth-token' in headers:
@@ -56,60 +119,40 @@ class CloudFS(object):
             if 'x-account-bytes-used' in headers:
                 self.free_blocks = self.block_quota - int(headers['x-account-bytes-used'])
             if 'x-account-object-count' in headers:
-                print("Not handling")
-                #self.
+                pass
 
-    def _send_request_size(self, method, path, fh = None, 
-            extra_headers = {}, file_size = None, is_segment = False):
+    def _send_request(self, method, path, extra_headers = [], params = None):
         tries = 3
-
+        headers = dict(extra_headers)
+        headers['X-Auth-Token'] = self.storage_token
+        method = method.upper()
+        path = unquote(path)
+        url = u'{}{}/{}'.format(self.storage_url, self.default_container, path)
+        print(url)
+        
+        if 'MKDIR' == method:
+            headers['Content-Type'] = 'application/directory'
+            pass
+        elif 'MKLINK' == method:
+            headers['Content-Type'] = 'application/link'
+            pass
+        elif 'PUT' == method:
+            pass
+        elif 'GET' == method:
+            pass
+        elif 'DELETE' == method:
+            pass
         while tries > 0:
-            headers = dict(extra_headers)
-            url = "{}/{}".format(self.storage_url, path)
-            if self.storage_url is None:
-                print("No storage URL set")
-                return
-            path = unquote(path)
-            headers['X-Auth-Token'] = self.storage_token
-            if method == 'MKDIR':
-                headers['Content-Type'] = 'application/directory'
-            elif method == 'MKLINK':
-                headers['Content-Type'] = 'application/link'
-            elif method == 'PUT' and is_segment:
-                pass
-            elif method == 'PUT' and fp is not None:
-                pass
-            elif method == 'GET':
-                if is_segment:
-                    print("unsupported")
-                    pass
-                elif fh is not None:
-                    pass
-            elif method == 'DELETE':
-                print("method", method)
-            else:
-                pass
-            response = requests.request(method, url=url, headers=headers)
-            
-            if response.status_code == 401:
+            response = requests.request(method, url=url, 
+                    headers=headers, params=params)
+            if 401 == response.status_code:
                 self.connect()
-            if response.status_code >= 200 and response.status_code <= 400 or (response.status_code == 409 and method == 'DELETE'):
+            elif (response.status_code >= 200 and response.status_code <= 400 or 
+            (response.status_code == 409 and method == 'DELETE')):
+                self._header_dispatch(response.headers)
                 return response
-            print response
             tries -= 1
-
-    def read_file(self, fh):
-        """read a file handler stream"""
-        # object_read_fp
-        pass
-
-    def write_file(self, fh):
-        """write a file handler stream"""
-        # object_write_fp
-        pass
-
-    def file_size(self, fh):
-        pass
+        return response
 
     def create_symlink(self, src, dst):
         """create a symlink"""
@@ -121,10 +164,10 @@ class CloudFS(object):
 
     def _cache_directory(self, refresh = False):
         if refresh or self._dircache is None:
-            default_container = self._send_request_size('GET', '').content.replace('\n', '')
-            data = self._send_request_size('GET', '{}/?format=json'.format(
-                default_container)
-                ).json()
+            resp = self._send_request('GET', 
+                    '', params={'format':'json'}
+                )
+            data = resp.json()
             datatree = {}
             for f in data:
                 if f['content_type'] == 'application/directory': continue
@@ -149,9 +192,18 @@ class CloudFS(object):
             if isinstance(n, ValueError):
                 raise n
 
-        files = [ a for a in n.itervalues() if isinstance(a, File)]
-        dirs = [ a for a in n.itervalues() if isinstance(a, Directory)]
+        files = [a for a in n.itervalues() if isinstance(a, File)]
+        dirs = {k: a for k, a in n.iteritems() if isinstance(a, Directory)}
         return files, dirs
+
+    def get_file(self, path, packetsize = 512*1024, offset = 0):
+        data = self._send_request('HEAD', path)
+        filesize = data.headers['content-length']
+        if filesize > packetsize:
+            pass
+        else:
+            pass
+        return FileIO(url = path, cfsobj = self)
 
     def delete_object(self, objpath):
         pass
@@ -177,6 +229,7 @@ class CloudFS(object):
         self.file_quota = None
         self.files_free = None
         self._dircache = None
+        self._default_container = None
 
 
 class Hubic(CloudFS):
