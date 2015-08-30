@@ -19,6 +19,7 @@ from threading import Thread
 from time import sleep
 from datetime import datetime
 import copy
+import sys
 #define BUFFER_INITIAL_SIZE 4096
 #define MAX_HEADER_SIZE 8192
 #define MAX_PATH_SIZE (1024 + 256 + 3)
@@ -450,8 +451,12 @@ class Hubic(CloudFS):
 if __name__ == '__main__':
     from os import environ
     from sys import argv
-    filepath, targetfolder = argv[1:3]
-    targetfile = os.path.basename(filepath) if len(argv) == 3 else argv[3]
+    verb = argv[1]
+    if verb not in 'create replace'.split():
+        print("Usage: %s <create|replace> local_fn remote_folder [remote_fn]" % (argv[0],) )
+        sys.exit(0)
+    filepath, targetfolder = argv[2:4]
+    targetfile = os.path.basename(filepath) if len(argv) == 4 else argv[4]
 
     client_id = environ['HUBIC_CLIENT_ID']
     client_secret = environ['HUBIC_CLIENT_SECRET']
@@ -459,6 +464,12 @@ if __name__ == '__main__':
 
     h = Hubic(client_id, client_secret, ref_token)
     h.connect()
+    if verb == 'create':
+        f, d = h.list_directory(targetfolder)
+        for a in f:
+            if a['name'].split('/')[-1] == targetfile:
+                print("File exists")
+                sys.exit(0)
     h.write_stream(io.FileIO(filepath, "rb"), "{}/{}".format(targetfolder, targetfile))
     h.upload_queue()
     print("Uploaded {} to {}".format(filepath, targetfolder))
