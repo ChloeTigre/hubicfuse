@@ -1,0 +1,5 @@
+# cloudfs.py
+
+This is a library to connect to OpenStack Swift in Python apps. It is loosely
+based on cloudfuse by Michael Barton for the implementation details and on
+work by the Hubicfuse team for the HubiC ® authentication process.
