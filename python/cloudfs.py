@@ -448,31 +448,44 @@ class Hubic(CloudFS):
         CloudFS.__init__(self, *args, **kwargs)
 
 
+def upload_file(h, verb, local, directory, remote):
+    if verb == 'create':
+        try:
+            f, d = h.list_directory(directory)
+            for a in f:
+                if a['name'].split('/')[-1] == targetfile:
+                    print("File exists")
+                    return
+        except ValueError:
+            pass
+    h.write_stream(io.FileIO(local, "rb"), "{}/{}".format(directory, remote))
+    h.upload_queue()
+    print("Uploaded {} to {}".format(local, directory))
+
+
 if __name__ == '__main__':
     from os import environ
     from sys import argv
     verb = argv[1]
     if verb not in 'create replace'.split():
-        print("Usage: %s <create|replace> local_fn remote_folder [remote_fn]" % (argv[0],) )
+        print("Usage: %s <create|replace> <local_fn remote_folder [remote_fn]| 'pipe' root_folder>" % (argv[0],) )
         sys.exit(0)
-    filepath, targetfolder = argv[2:4]
-    targetfile = os.path.basename(filepath) if len(argv) == 4 else argv[4]
-
     client_id = environ['HUBIC_CLIENT_ID']
     client_secret = environ['HUBIC_CLIENT_SECRET']
     ref_token = environ['HUBIC_REFRESH_TOKEN']
-
     h = Hubic(client_id, client_secret, ref_token)
     h.connect()
-    if verb == 'create':
-        f, d = h.list_directory(targetfolder)
-        for a in f:
-            if a['name'].split('/')[-1] == targetfile:
-                print("File exists")
-                sys.exit(0)
-    h.write_stream(io.FileIO(filepath, "rb"), "{}/{}".format(targetfolder, targetfile))
-    h.upload_queue()
-    print("Uploaded {} to {}".format(filepath, targetfolder))
+    if argv[2] == 'pipe':
+        tgtdir = argv[3]
+        for line in sys.stdin:
+            line = line.replace('\n', '')
+            d = tgtdir + os.path.dirname(line)
+            tgt = os.path.basename(line)
+            upload_file(h, 'create', line, d, tgt)
+    else:
+        filepath, targetfolder = argv[2:4]
+        targetfile = os.path.basename(filepath) if len(argv) == 4 else argv[4]
+        upload_file(h, verb, filepath, targetfolder, targetfile)
 
 
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
