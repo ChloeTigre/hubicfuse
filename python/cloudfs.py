@@ -14,8 +14,11 @@ import json
 import enum
 import io
 from urllib2 import unquote, quote
-
+from math import ceil
+from threading import Thread
+from time import sleep
 from datetime import datetime
+import copy
 #define BUFFER_INITIAL_SIZE 4096
 #define MAX_HEADER_SIZE 8192
 #define MAX_PATH_SIZE (1024 + 256 + 3)
@@ -44,15 +47,24 @@ class Directory(OrderedDict):
         self.dirname = dirname
         OrderedDict.__init__(self, *args, **kwargs)
 
-class FileIO(object):
-
+class CloudFileReader(object):
     MAX_CHUNK_SIZE = 1024 * 1024 * 2
 
-    """totally thread unsafe IO interface with a read buffer"""
+    """
+    Totally thread unsafe IO-like interface with a read buffer and some extra functionalities
+    """
     def __init__(self, url, cfsobj):
         self.url = url
         self.cfsobj = cfsobj
         self.reset()
+
+    @property 
+    def current_data(self):
+        return self._datawindow[self._lhead:-1]
+
+    @property
+    def feof(self):
+        return self._head == self._size
 
     def reset(self):
         self._head = 0
@@ -62,7 +74,6 @@ class FileIO(object):
         self._feof = False
         self.closed = False
         self._getinfo()
-
 
     def stat(self):
         return dict(st_mode=self.cfsobj._mode, st_mtime=self._mtime,
@@ -116,49 +127,108 @@ class FileIO(object):
                     continue
                 else:
                     left = size - len(oldchunk) + oldhead
-                    yield oldchunk[oldhead:-1] + self._datawindow[0:left]
                     self._lhead = left
                     data_to_read -= size
+                    yield oldchunk[oldhead:-1] + self._datawindow[0:left]
             else:
-                yield self._datawindow[self._lhead:self._lhead+size]
                 self._lhead += size
                 data_to_read -= size
+                yield self._datawindow[self._lhead-size:self._lhead]
 
     def read(self, size=-1):
-        if self.closed: return IOError("reading closed file")
+        if self.closed: raise IOError("reading closed file")
         return ''.join(a for a in self.read_generator(size))
         
+    def read1(self, size=-1):
+        return self.read(size)
+
     def seekable(self):
         return False
     
     def readable(self):
         return self._readable
 
+    def writable(self):
+        return False
+
     def tell(self):
         return self._head + self._lhead
 
     def close(self):
         self.closed = True
+
     
+    def readline_generator(self, size=-1):
+        if self.closed: raise IOError("reading closed file")
+        if self.feof: yield ""
+        else:
+            lfpos = self.current_data.find('\n')
+            if lfpos > 0:
+                # advance head anyway
+                self._lhead += lfpos
+                if size > -1:
+                    #reduce head if size given: yield incomplete line
+                    lfpos = min(lfpos, size)
+                yield self._datawindow[self._lhead - lfpos:self._lhead]
+
     def readline(self, size=-1):
-        pass
+        if self.closed: raise IOError("reading closed file")
+        if self.feof: return ""
+        return next(self.readline_generator(size))
+
+    def readlines_generator(self, hint=-1):
+        if self.closed: raise IOError("reading closed file")
+        br = 0
+        while not self.feof:
+            d = self.readline(-1)
+            br += len(d)
+            yield d
+            if hint > 0 and br > hint:
+                break
 
     def readlines(self, hint=-1):
-        pass
+        if self.closed: raise IOError("reading closed file")
+        return [a for a in self.readlines_generator(hint)]
 
+    def readinto(self, b):
+        if self.closed: raise IOError("reading closed file")
+        if not isinstance(b, bytearray):
+            return None
+        maxreads = len(b)
+        reads = 0
+        while reads < maxreads and not self.feof:
+            b[reads] = self.read(1)
+            reads += 1
+        return reads
+
+    def next(self):
+        if self.feof: raise StopIteration
+        return self.read(1)
+
+    def getvalue(self):
+        if self.closed: raise IOError("reading closed file")
+        self.reset()
+        return self.read(-1)
 
 class CloudFS(object):
     """
     Implements CloudFS logic in python. Some logic is deported to specific objects
-        - Files are hadled by FileIO which implements an IO-like interface
+        - Files are handled by CloudFileReader which implements an IO-like interface
+            to files
     """
+
+    # we split files bigger than 10 MB into chunks
+    # and use a manifest file
+    MAX_FILE_CHUNK_SIZE = 1024 * 1024 * 10
+    CHUNKS_FOLDER = 'system/chunks'
+    MAX_UPLOAD_THREADS = 6
 
     @property
     def default_container(self):
         if self._default_container is None:
             self._default_container = ''
             dc = self._send_request('GET', '').content.replace('\n', '')
-            self._default_container = '/' + dc
+            self._default_container = dc
         return self._default_container
 
     def _header_dispatch(self, headers):
@@ -175,29 +245,42 @@ class CloudFS(object):
         if 'x-account-object-count' in headers:
             pass
 
-    def _send_request(self, method, path, extra_headers = [], params = None):
+    def _send_request(self, method, path, extra_headers = [], params = None, payload = None):
         tries = 3
         headers = dict(extra_headers)
         headers['X-Auth-Token'] = self.storage_token
         method = method.upper()
         path = unquote(path)
-        url = u'{}{}/{}'.format(self.storage_url, self.default_container, path)
+        extra_args = {}
+        url = u'{}/{}/{}'.format(self.storage_url, self.default_container, path)
         
         if 'MKDIR' == method:
             headers['Content-Type'] = 'application/directory'
+            method = 'PUT'
             pass
         elif 'MKLINK' == method:
             headers['Content-Type'] = 'application/link'
             pass
         elif 'PUT' == method:
-            pass
+            if isinstance(payload, basestring):
+                streamsize = len(payload)
+            elif isinstance(payload, io.FileIO) or isinstance(payload, file):
+                streamsize = os.path.getsize(payload.name)
+            if streamsize > self.MAX_FILE_CHUNK_SIZE:
+                # send to upload queue and return
+                print("Big file, queueing")
+                self._uploadqueue.add((path, payload, streamsize))
+                return
+            else:
+                # dicfrect upload
+                extra_args = dict(data=payload)
         elif 'GET' == method:
             pass
         elif 'DELETE' == method:
             pass
         while tries > 0:
             response = requests.request(method, url=url, 
-                    headers=headers, params=params)
+                    headers=headers, params=params, **extra_args)
             if 401 == response.status_code:
                 self.connect()
             elif (response.status_code >= 200 and response.status_code <= 400 or 
@@ -213,7 +296,7 @@ class CloudFS(object):
 
     def create_directory(self, label):
         """create a directory"""
-        pass
+        return self._send_request('MKDIR', label)
 
     def _cache_directory(self, refresh = False):
         if refresh or self._dircache is None:
@@ -250,10 +333,14 @@ class CloudFS(object):
         return files, dirs
 
     def get_file(self, path, packetsize = 512*1024, offset = 0):
-        return FileIO(url = path, cfsobj = self)
+        return CloudFileReader(url = path, cfsobj = self)
 
     def delete_object(self, objpath):
         pass
+
+    def write_stream(self, stream, path):
+        " writes a stream to a path in an existing container. "
+        return self._send_request('PUT', path, payload = stream)
 
     def copy_object(self, src, dst):
         pass
@@ -266,6 +353,51 @@ class CloudFS(object):
         self.client_secret = client_secret
         self.refresh_token = refresh_token
 
+    def upload_queue(self):
+        def _get_parts(stream, pfx, sz, totalsize):
+            parts = ceil(totalsize / sz)
+            partstrlen = len(str(parts)) + 1
+            spl = pfx.split('/')
+            chunkfolder = '/'.join(spl[0:-1])
+            #a = stream.read(sz)
+            i = 0
+            #while len(a) > 0:
+            while True:
+                d = stream.read(sz)
+                if len(d) == 0: break
+                yield (pfx, str(i).zfill(partstrlen), d)
+                i += 1
+
+        def _file_uploader(url, headers, data):
+            print("Sending %s" % (url,))
+            requests.put(url, headers = headers, data = data)
+            print("Done putting", url)
+
+        queues = {}
+        headers = {}
+        threads = []
+        for path, stream, streamsize in self._uploadqueue:
+            for pfx, chunk, data in _get_parts(stream, 
+                    self.CHUNKS_FOLDER + path, self.MAX_FILE_CHUNK_SIZE, streamsize):
+                self.create_directory(self.CHUNKS_FOLDER + '/' + path)
+                headers['X-Auth-Token'] = self.storage_token
+                url = u'{}/{}/{}/{}/{}'.format(self.storage_url, self.default_container, self.CHUNKS_FOLDER, path, chunk)
+                t = Thread(target=_file_uploader,
+                    args=(url, headers, data))
+                threads.append(t)
+                t.start()
+                while len([_ for _ in threads if _.isAlive()]) > self.MAX_UPLOAD_THREADS:
+                    sleep(0.5)
+                    print("waiting")
+            url = u'{}/{}/{}'.format(self.storage_url, self.default_container, path)
+            headers['X-Object-Manifest'] = '{}/{}/{}/'.format(self._default_container, self.CHUNKS_FOLDER, path)
+            headers['Content-Type'] = 'application/octet-stream'
+            requests.put(url, headers = headers, data = '')
+            print("Created item")
+        print("Joining laties")
+        for t in threads: t.join()
+        print("Done joining laties")
+        self._uploadqueue.clear()
     def __init__(self, parameters = {}):
         # initialize structures
         self.statcache = dict()
@@ -280,7 +412,9 @@ class CloudFS(object):
         self._uid = parameters.get('uid', 0)
         self._gid = parameters.get('uid', 0)
         self._mode = parameters.get('mode', 0750)
-
+        self._uploadqueue = set()
+        self._uploadpartsqueue = set()
+        self.stopped = False
 
 class Hubic(CloudFS):
     def connect(self):
@@ -311,6 +445,23 @@ class Hubic(CloudFS):
         self.client_secret = client_secret
         self.refresh_token = refresh_token
         CloudFS.__init__(self, *args, **kwargs)
+
+
+if __name__ == '__main__':
+    from os import environ
+    from sys import argv
+    filepath, targetfolder = argv[1:3]
+    targetfile = os.path.basename(filepath) if len(argv) == 3 else argv[3]
+
+    client_id = environ['HUBIC_CLIENT_ID']
+    client_secret = environ['HUBIC_CLIENT_SECRET']
+    ref_token = environ['HUBIC_REFRESH_TOKEN']
+
+    h = Hubic(client_id, client_secret, ref_token)
+    h.connect()
+    h.write_stream(io.FileIO(filepath, "rb"), "{}/{}".format(targetfolder, targetfile))
+    h.upload_queue()
+    print("Uploaded {} to {}".format(filepath, targetfolder))
 
 
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
