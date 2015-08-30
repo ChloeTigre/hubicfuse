@@ -453,7 +453,7 @@ def upload_file(h, verb, local, directory, remote):
         try:
             f, d = h.list_directory(directory)
             for a in f:
-                if a['name'].split('/')[-1] == targetfile:
+                if a['name'].split('/')[-1] == remote:
                     print("File exists")
                     return
         except ValueError:
@@ -468,7 +468,7 @@ if __name__ == '__main__':
     from sys import argv
     verb = argv[1]
     if verb not in 'create replace'.split():
-        print("Usage: %s <create|replace> <local_fn remote_folder [remote_fn]| 'pipe' root_folder>" % (argv[0],) )
+        print("Usage: %s <create|replace> <(local_fn remote_folder [remote_fn])|('pipe' root_folder)>" % (argv[0],) )
         sys.exit(0)
     client_id = environ['HUBIC_CLIENT_ID']
     client_secret = environ['HUBIC_CLIENT_SECRET']
